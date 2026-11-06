@@ -1,0 +1,27 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local run outputs (logger creates these next to main.py)
+*_hist.png
+*.log
+
+# Ignore typical run folders created by -o NAME (keep source tracked)
+# Uncomment or extend as needed for your naming conventions:
+# TEST/
+# TEST_*/
+# 20*/
