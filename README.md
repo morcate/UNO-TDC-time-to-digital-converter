@@ -4,7 +4,7 @@
 
 ## About
 The UNO-TDC is a Time to Digital Converter (TDC) that performs the function of a stopwatch and measures the elapsed time between a START pulse and up to five STOP pulses.
-The UNO-TDC is a cheap effective acquisition system for nuclear physics experiments. It can be built using off the shelf component like an Arduino UNO and a Texas Instruments TDC7200.
+The UNO-TDC is a cheap effective acquisition system for nuclear physics experiments. It can be built using off the shelf component like an Arduino UNO and a Texas Instruments TDC7200. TEST
 
 ## Specifications overview
 The UNO-TDC has a measurement range of 14ns to 3926ns, and a dead time of 100us between two consecutive measurements. UNO-TDC must always receive a STOP signal because it does not feature a STOP timeout. The measurement resolution is 55ps and the error varies according to the measurement range as described in the "UNO-TDC datasheet". As a "rule of thumb" 1% error could be considered on all ranges. The data is not saved but continuously streamed to the computer on the serial port.
