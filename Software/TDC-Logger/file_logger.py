@@ -25,6 +25,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -38,11 +39,16 @@ class DualFileLogger:
     Manages the output folder ./<NAME>/ and handles safe writing to:
     - ./<NAME>/<NAME>_raw.log (all serial traffic, frequent flush)
     - ./<NAME>/<NAME>.log (valid parsed measurements, buffered write)
+
+    close() always flushes buffers and fsyncs so Ctrl+C / normal stop does not
+    leave ToF samples only in RAM.
     """
 
     def __init__(self, base_name: Optional[str], use_timestamp: bool, enable_parsed: bool = True):
         self.use_timestamp = use_timestamp
         self.enable_parsed = enable_parsed
+        self._lock = threading.Lock()
+        self._closed = False
 
         # Determine base name and strip any user-supplied extension (.log, .txt)
         if base_name:
@@ -63,9 +69,10 @@ class DualFileLogger:
         self.raw_file_path = self.folder_path / f"{clean_name}_raw.log"
         self.parsed_file_path = self.folder_path / f"{clean_name}.log"
 
-        self._raw_file = open(self.raw_file_path, mode="a", encoding="utf-8")
+        # line-buffered text where possible; we still flush/fsync explicitly
+        self._raw_file = open(self.raw_file_path, mode="a", encoding="utf-8", buffering=1)
         self._parsed_file = (
-            open(self.parsed_file_path, mode="a", encoding="utf-8")
+            open(self.parsed_file_path, mode="a", encoding="utf-8", buffering=1)
             if self.enable_parsed
             else None
         )
@@ -80,54 +87,105 @@ class DualFileLogger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " "
 
     def log_raw(self, line: str, is_measurement: bool = True) -> None:
-        """Writes a line to <NAME>_raw.log and forces immediate flush."""
-        prefix = self._get_timestamp_prefix() if (self.use_timestamp and is_measurement) else ""
-        self._raw_file.write(f"{prefix}{line}\n")
-        self._raw_counter += 1
+        """Writes a line to <NAME>_raw.log and flushes according to RAW_FLUSH_EVERY_N."""
+        with self._lock:
+            if self._closed or self._raw_file is None or self._raw_file.closed:
+                return
+            prefix = self._get_timestamp_prefix() if (self.use_timestamp and is_measurement) else ""
+            self._raw_file.write(f"{prefix}{line}\n")
+            self._raw_counter += 1
 
-        if self._raw_counter >= RAW_FLUSH_EVERY_N:
-            self._raw_file.flush()
-            self._raw_counter = 0
-            self._check_fsync()
+            if self._raw_counter >= RAW_FLUSH_EVERY_N:
+                self._raw_file.flush()
+                self._raw_counter = 0
+                self._fsync_unlocked(force=False)
 
     def log_parsed(self, formatted_value: str) -> None:
         """Buffers valid calculated measurements and writes them to <NAME>.log."""
-        if not self._parsed_file:
-            return
-
-        self._parsed_buffer.append(f"{formatted_value}\n")
-
-        if len(self._parsed_buffer) >= PARSED_BUFFER_SIZE:
-            self.flush_parsed()
+        with self._lock:
+            if self._closed or not self._parsed_file or self._parsed_file.closed:
+                return
+            self._parsed_buffer.append(f"{formatted_value}\n")
+            if len(self._parsed_buffer) >= PARSED_BUFFER_SIZE:
+                self._flush_parsed_unlocked()
 
     def flush_parsed(self) -> None:
         """Flushes the in-memory parsed measurement buffer to disk."""
-        if self._parsed_file and self._parsed_buffer:
+        with self._lock:
+            self._flush_parsed_unlocked()
+
+    def _flush_parsed_unlocked(self) -> None:
+        if self._parsed_file and not self._parsed_file.closed and self._parsed_buffer:
             self._parsed_file.writelines(self._parsed_buffer)
             self._parsed_file.flush()
             self._parsed_buffer.clear()
-            self._check_fsync()
+            self._fsync_unlocked(force=False)
 
-    def _check_fsync(self) -> None:
-        """Periodically forces OS disk synchronization to prevent data loss on power failure."""
+    def _fsync_unlocked(self, force: bool = False) -> None:
+        """OS-level fsync; force=True ignores the periodic interval (used on close)."""
         now = time.monotonic()
-        if (now - self._last_fsync_time) >= FSYNC_INTERVAL_SEC:
-            os.fsync(self._raw_file.fileno())
-            if self._parsed_file:
-                os.fsync(self._parsed_file.fileno())
-            self._last_fsync_time = now
-
-    def close(self) -> None:
-        """Flushes all remaining buffers, syncs to disk, and closes file descriptors."""
+        if not force and (now - self._last_fsync_time) < FSYNC_INTERVAL_SEC:
+            return
         try:
-            self.flush_parsed()
             if self._raw_file and not self._raw_file.closed:
                 self._raw_file.flush()
                 os.fsync(self._raw_file.fileno())
-                self._raw_file.close()
             if self._parsed_file and not self._parsed_file.closed:
                 self._parsed_file.flush()
                 os.fsync(self._parsed_file.fileno())
-                self._parsed_file.close()
-        except Exception:
+            self._last_fsync_time = now
+        except OSError:
+            # Disk errors must not crash the acquisition loop; close() will retry.
             pass
+
+    def sync(self) -> None:
+        """Flush all buffers and fsync immediately (safe mid-run checkpoint)."""
+        with self._lock:
+            if self._closed:
+                return
+            self._flush_parsed_unlocked()
+            if self._raw_file and not self._raw_file.closed:
+                self._raw_file.flush()
+            self._fsync_unlocked(force=True)
+
+    def close(self) -> None:
+        """
+        Durable shutdown: flush parsed buffer, flush raw, fsync both files, then close.
+
+        Safe to call multiple times. Individual steps are isolated so one failure
+        cannot skip the other file.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+            # 1) Parsed buffer first (only place samples can still live in RAM)
+            try:
+                self._flush_parsed_unlocked()
+            except Exception:
+                pass
+
+            # 2) Raw file
+            try:
+                if self._raw_file and not self._raw_file.closed:
+                    self._raw_file.flush()
+                    try:
+                        os.fsync(self._raw_file.fileno())
+                    except OSError:
+                        pass
+                    self._raw_file.close()
+            except Exception:
+                pass
+
+            # 3) Parsed file handle
+            try:
+                if self._parsed_file and not self._parsed_file.closed:
+                    self._parsed_file.flush()
+                    try:
+                        os.fsync(self._parsed_file.fileno())
+                    except OSError:
+                        pass
+                    self._parsed_file.close()
+            except Exception:
+                pass

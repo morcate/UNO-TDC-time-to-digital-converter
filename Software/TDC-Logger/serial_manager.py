@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Filename: serial_manager.py
-Version: 1.1.0
-Date: 2026-11-06
+Version: 1.2.0
+Date: 2026-11-07
 Author: Gemini
-Description: Serial port discovery, smart auto-selection, and full-duplex UART handler.
+Description: Serial port discovery, simple auto-selection, and full-duplex UART handler.
 Requirements: pyserial>=3.5
 Installation: pip install pyserial
 
@@ -55,6 +55,24 @@ class SerialManager:
         self.tx_thread: Optional[threading.Thread] = None
 
     @staticmethod
+    def normalize_port_name(port: str) -> str:
+        """
+        Normalize user port input.
+
+        On Windows, bare digits become COMn (e.g. '3' -> 'COM3').
+        Elsewhere the string is stripped only.
+        """
+        cleaned = port.strip()
+        if not cleaned:
+            return cleaned
+        if sys.platform == "win32" and cleaned.isdigit():
+            return f"COM{cleaned}"
+        # Allow com3 / Com3
+        if sys.platform == "win32" and cleaned.upper().startswith("COM"):
+            return "COM" + cleaned[3:] if cleaned[3:].isdigit() else cleaned.upper()
+        return cleaned
+
+    @staticmethod
     def rank_ports() -> List[Tuple[int, str, str]]:
         """
         Scan available COM ports and assign a priority score for Arduino detection.
@@ -73,10 +91,10 @@ class SerialManager:
 
             if vid in ARDUINO_OFFICIAL_VIDS or "arduino" in desc.lower():
                 priority = 1
-                tag = "[Arduino detected]"
+                tag = "[Arduino]"
             elif vid in COMMON_USB_UART_VIDS or "usb" in hwid.lower():
                 priority = 2
-                tag = "[USB-Serial candidate]"
+                tag = "[USB-Serial]"
             else:
                 priority = 3
                 tag = ""
@@ -98,8 +116,8 @@ class SerialManager:
         print("\n--- Detected serial ports ---")
         for idx, (prio, _dev, display) in enumerate(ranked, start=1):
             default_marker = "  <-- preferred" if idx == 1 else ""
-            prio_label = {1: "P1", 2: "P2", 3: "P3"}.get(prio, "P?")
-            print(f"  [{idx}] ({prio_label}) {display}{default_marker}")
+            prio_label = {1: "Arduino", 2: "USB-Serial", 3: "Other"}.get(prio, "?")
+            print(f"  [{idx}] {display}  ({prio_label}){default_marker}")
         print()
         return ranked
 
@@ -108,49 +126,52 @@ class SerialManager:
         cls,
         port: Optional[str] = None,
         *,
-        auto: bool = True,
-        interactive: bool = True,
+        interactive: bool = False,
     ) -> str:
         """
-        Resolve the serial port to open with a streamlined policy:
+        Resolve which serial port to open (simple policy):
 
-        1. If `port` is given, use it as-is (after basic normalisation).
-        2. If `auto` is True:
-           - exactly one port overall  -> use it
-           - exactly one priority-1 Arduino -> use it
-           - exactly one priority-1/2 candidate and nothing else preferred -> use best
-        3. If still unresolved and `interactive` is True, prompt the user.
-        4. Otherwise raise RuntimeError.
+        1. If `-p` / port is given → use it (normalized).
+        2. Else if exactly one sensible choice exists → auto-select
+           (single port, or single Arduino, or single USB-serial candidate).
+        3. Else if `interactive` or a TTY is available → prompt (Enter = preferred).
+        4. Else raise with a hint to pass `-p` or run `ports`.
         """
         if port:
-            return port.strip()
+            return cls.normalize_port_name(port)
 
         ranked = cls.rank_ports()
         if not ranked:
-            raise RuntimeError("No serial ports detected on this system.")
+            raise RuntimeError(
+                "No serial ports detected. Plug in the Arduino and run: python main.py ports"
+            )
 
-        if auto:
+        if not interactive:
             auto_port = cls._try_auto_select(ranked)
             if auto_port is not None:
-                print(f"[INFO] Auto-selected serial port: {auto_port}")
+                # Show a one-line confirmation so the user knows what was chosen
+                label = next((d for _p, dev, d in ranked if dev == auto_port), auto_port)
+                print(f"[INFO] Using serial port: {label}")
                 return auto_port
 
-        if interactive:
+        # Ambiguous (or forced interactive): menu if possible
+        if sys.stdin is not None and sys.stdin.isatty():
             return cls.select_port_interactively(ranked)
 
+        devices = ", ".join(dev for _p, dev, _d in ranked)
         raise RuntimeError(
-            "Ambiguous serial port selection. Pass -p COMx or run without --no-interactive."
+            "Ambiguous serial ports and no interactive terminal. "
+            f"Available: {devices}. Pass -p COMx or run: python main.py ports"
         )
 
     @staticmethod
     def _try_auto_select(ranked: List[Tuple[int, str, str]]) -> Optional[str]:
         """
-        Return a port device string when the choice is unambiguous, else None.
+        Return a port when the choice is unambiguous, else None.
 
-        Rules (first match wins):
-        - Single port on the machine.
-        - Single official Arduino (priority 1).
-        - Single USB-serial candidate (priority <= 2) when no other P1/P2 exists.
+        - Only one port on the machine.
+        - Exactly one official Arduino (priority 1), even if other ports exist.
+        - Exactly one USB-serial / Arduino candidate (priority <= 2).
         """
         if len(ranked) == 1:
             return ranked[0][1]
@@ -176,15 +197,18 @@ class SerialManager:
             raise RuntimeError("No serial ports detected on this system.")
 
         default_port = ranked[0][1]
-        print("\n--- Detected serial ports ---")
+        print("\n--- Select serial port ---")
         for idx, (_, _dev, display) in enumerate(ranked, start=1):
-            default_marker = "  <-- DEFAULT" if idx == 1 else ""
+            default_marker = "  <-- Enter" if idx == 1 else ""
             print(f"  [{idx}] {display}{default_marker}")
 
         while True:
-            user_input = input(
-                f"\nSelect port [Enter = {default_port}, or type index/name]: "
-            ).strip()
+            try:
+                user_input = input(
+                    f"\nPort [Enter={default_port}, #, or name]: "
+                ).strip()
+            except EOFError:
+                return default_port
 
             if not user_input:
                 return default_port
@@ -193,12 +217,18 @@ class SerialManager:
                 choice_idx = int(user_input)
                 if 1 <= choice_idx <= len(ranked):
                     return ranked[choice_idx - 1][1]
+                # Bare COM number on Windows (e.g. type 5 for COM5) if listed
+                normalized = cls.normalize_port_name(user_input)
+                for _, dev, _ in ranked:
+                    if normalized.upper() == dev.upper():
+                        return dev
 
+            normalized = cls.normalize_port_name(user_input)
             for _, dev, _ in ranked:
-                if user_input.upper() == dev.upper():
+                if normalized.upper() == dev.upper() or user_input.upper() == dev.upper():
                     return dev
 
-            print("Invalid selection. Try again.")
+            print("Invalid selection. Try again (number or COMx).")
 
     def open(self) -> None:
         """Open the hardware UART port and start RX and TX worker threads."""
@@ -207,8 +237,9 @@ class SerialManager:
             baudrate=self.baudrate,
             timeout=SERIAL_TIMEOUT_SEC,
         )
-        self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
-        self.tx_thread = threading.Thread(target=self._tx_loop, daemon=True)
+        # Non-daemon so we can join them on clean shutdown and finish pending I/O.
+        self.rx_thread = threading.Thread(target=self._rx_loop, name="tdc-rx", daemon=True)
+        self.tx_thread = threading.Thread(target=self._tx_loop, name="tdc-tx", daemon=True)
         self.rx_thread.start()
         self.tx_thread.start()
 
@@ -216,7 +247,7 @@ class SerialManager:
         """Continuously read lines from the serial port and push them to rx_queue."""
         while not self.stop_event.is_set():
             try:
-                if self.serial_conn and self.serial_conn.in_waiting > 0:
+                if self.serial_conn and self.serial_conn.is_open and self.serial_conn.in_waiting > 0:
                     raw_bytes = self.serial_conn.readline()
                     if raw_bytes:
                         line = raw_bytes.decode("utf-8", errors="replace").strip("\r\n")
@@ -225,7 +256,10 @@ class SerialManager:
                 else:
                     # Brief sleep when idle to prevent CPU pegging
                     self.stop_event.wait(0.005)
-            except (serial.SerialException, OSError):
+            except (serial.SerialException, OSError, ValueError):
+                self.stop_event.set()
+                break
+            except Exception:
                 self.stop_event.set()
                 break
 
@@ -233,23 +267,28 @@ class SerialManager:
         """
         Capture user keystrokes to reply to prompts like 'press any key to start'.
         Uses msvcrt on Windows for instant single-key transmission without Enter.
+        Ctrl+C (0x03) requests a clean stop via stop_event (does not kill mid-write).
         """
         while not self.stop_event.is_set():
             try:
                 if sys.platform == "win32":
                     if msvcrt.kbhit():
                         ch = msvcrt.getch()
-                        # Ignore Ctrl+C (0x03) so KeyboardInterrupt is handled by main
-                        if ch == b"\x03":
+                        # Ctrl+C → request orderly shutdown; main drains queue + flushes logs
+                        if ch in (b"\x03", b"\x00\x03"):
                             self.stop_event.set()
                             break
+                        if ch == b"\x00" or ch == b"\xe0":
+                            # Swallow special-key prefix/second byte
+                            if msvcrt.kbhit():
+                                msvcrt.getch()
+                            continue
                         if self.serial_conn and self.serial_conn.is_open:
                             self.serial_conn.write(ch)
                             self.serial_conn.flush()
                     else:
                         self.stop_event.wait(0.02)
                 else:
-                    # Fallback for non-Windows environments
                     line = sys.stdin.readline()
                     if line and self.serial_conn and self.serial_conn.is_open:
                         self.serial_conn.write(line.encode("utf-8"))
@@ -257,11 +296,23 @@ class SerialManager:
             except Exception:
                 break
 
-    def close(self) -> None:
-        """Safely close the serial port."""
+    def close(self, join_timeout_sec: float = 1.5) -> None:
+        """
+        Stop worker threads, close the serial port, and join threads.
+
+        Order: signal stop → close port (unblocks I/O) → join threads.
+        """
         self.stop_event.set()
-        if self.serial_conn and self.serial_conn.is_open:
+
+        conn = self.serial_conn
+        self.serial_conn = None
+        if conn is not None:
             try:
-                self.serial_conn.close()
+                if conn.is_open:
+                    conn.close()
             except Exception:
                 pass
+
+        for thread in (self.rx_thread, self.tx_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=join_timeout_sec)

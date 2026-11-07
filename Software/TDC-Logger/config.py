@@ -58,6 +58,12 @@ RAW_FLUSH_EVERY_N: int = 1         # Flush raw file on every line to prevent dat
 PARSED_BUFFER_SIZE: int = 50       # Flush parsed file every 50 valid measurements
 FSYNC_INTERVAL_SEC: float = 1.0    # Force OS-level disk synchronization interval
 
+# CLI stop-condition limits
+MAX_TIME_DAYS: int = 31            # Upper bound for --max-time (days)
+SECONDS_PER_DAY: int = 24 * 60 * 60
+SECONDS_PER_HOUR: int = 60 * 60
+SECONDS_PER_MINUTE: int = 60
+
 # USB Vendor IDs (VID) for Arduino auto-detection heuristics
 ARDUINO_OFFICIAL_VIDS = {
     0x2341,  # Arduino SA

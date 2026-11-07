@@ -43,7 +43,7 @@ TDC-Logger
 ├── CLI / orchestration .............. main.py
 │   ├── argparse (start | ports)
 │   ├── session loop (RX queue drain)
-│   ├── stop conditions (-m / -d / Ctrl+C)
+│   ├── stop conditions (-m max-samples XOR -T max-time / Ctrl+C)
 │   └── summary printout
 ├── I/O boundary ..................... serial_manager.py + config.py
 │   ├── port rank / auto / interactive
@@ -143,14 +143,13 @@ python main.py start -hh
 
 | Flag | Long | Description |
 |------|------|-------------|
-| `-p` | `--port COMx` | Serial port. If omitted: **auto-select** when unambiguous, otherwise prompt |
-| | `--no-auto-port` | Always prompt when `-p` is omitted |
-| | `--no-interactive` | Never prompt; fail if port cannot be auto-resolved (CI / scripts) |
+| `-p` | `--port COMx` | Serial port (`COM3` or bare `3` on Windows). Omit = auto / menu |
+| `-i` | `--interactive-port` | Always show the port menu (skip auto-select) |
 | `-b` | `--baud BPS` | Baud rate (default **38400**) |
 | `-a` | `--auto-start` | After 3 s send `a` every 1 s until data arrives |
 | `-t` | `--timestamp` | Prefix measurement lines in `*_raw.log` with `YYYY-mm-dd HH:MM:SS.mmm` |
-| `-m` | `--max-measures N` | Stop after **N** valid in-range (Stop IN) measurements |
-| `-d` | `--duration MIN` | Maximum acquisition duration in minutes |
+| `-m` | `--max-samples N` | Stop after **N** valid in-range (Stop IN) samples (positive integer) |
+| `-T` | `--max-time DURATION` | Stop after wall time, e.g. `"10d 3h 45m"` or `45m` (units **d/h/m**, max **31 days**) |
 | `-l` | `--lim-sup MAX` | Upper ToF threshold; values with `tof >= lim_sup` count as Stop OUT |
 | `-o` | `--out NAME` | Base name for output folder/files (default: timestamp) |
 | `-g` | `--hist` | Enable live ROOT-style histogram + HD PNG export |
@@ -159,14 +158,53 @@ python main.py start -hh
 | `-h` | `--help` | Short help |
 | `-hh` | `--help-detailed` | Full English architecture / usage manual |
 
-### Serial port selection policy
+### Stop conditions (mutually exclusive)
 
-When `-p` is omitted (default behaviour):
+At most one of the following may be set (or neither — run until Ctrl+C):
 
-1. **One port total** → auto-select it.
-2. **Exactly one official Arduino** (known VID / “Arduino” in description) → auto-select it.
-3. **Exactly one USB-UART candidate** (CH340, FTDI, CP210x, PL2303, …) → auto-select it.
-4. Otherwise → interactive menu (unless `--no-interactive`).
+| Option | Value | Notes |
+|--------|-------|-------|
+| `-m` / `--max-samples` | positive integer | Counts **Stop IN** samples only |
+| `-T` / `--max-time` | `Nd Nh Nm` | Days / hours / minutes; each unit at most once; total ≤ 31 days |
+
+Examples:
+
+```bash
+python main.py start -m 10000 -a -g -o TEST
+python main.py start -T "10d 3h 45m" -a -o LONG_RUN
+python main.py start -T 2h30m -a          # compact form, no spaces
+python main.py start -T 45m -a
+```
+
+Passing both `-m` and `-T` is a CLI error (`argparse` mutually exclusive group).
+
+### Serial port selection (simplified)
+
+| You want… | Command |
+|-----------|---------|
+| List ports | `python main.py ports` |
+| Auto / menu | `python main.py start …` (no `-p`) |
+| Force menu | `python main.py start -i …` |
+| Explicit port | `python main.py start -p COM3 …` or `-p 3` |
+
+When `-p` is omitted and `-i` is not set:
+
+1. **One port total** → use it.
+2. **Exactly one Arduino** (official VID / name) → use it (even if other COM ports exist).
+3. **Exactly one USB-serial candidate** → use it.
+4. Otherwise → interactive menu (Enter = preferred).
+
+### Safe stop (Ctrl+C)
+
+Stopping with **Ctrl+C** (or SIGTERM) runs an ordered shutdown:
+
+1. Signal RX/TX threads to stop
+2. **Drain** any lines already queued
+3. Close the serial port and join worker threads
+4. **Flush + `os.fsync`** both log files (parsed buffer included)
+5. Save the histogram image (best-effort; logs are already durable)
+
+Do not use force-kill (`taskkill /F`) if you need the last buffered samples on disk.
 
 ---
 

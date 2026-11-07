@@ -10,6 +10,7 @@ TDC-Logger/
 ├── Entry & CLI
 │   └── main.py
 │       • argparse: start | ports | -hh detailed manual
+│       • stop: -m/--max-samples XOR -T/--max-time (Nd Nh Nm, ≤31d)
 │       • session orchestration (queue, stop conditions, summary)
 │       • wires SerialManager + TdcProcessor + DualFileLogger + RootHistogramManager
 │
