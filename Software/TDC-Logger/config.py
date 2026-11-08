@@ -50,8 +50,19 @@ SERIAL_TIMEOUT_SEC: float = 0.1
 
 # Data Parsing & TDC Math Constants
 SEPCHAR: str = chr(32)  # ASCII 32 (Space)
-TDC_CLOCK_FACTOR: float = 562.5
-EXPECTED_REGISTER_BYTES: int = 9
+TDC_CLOCK_FACTOR: float = 562.5          # Mode 1: tof = time * factor / (cal2-cal1)
+TDC_CLK_PERIOD_NS: float = 62.5          # 16 MHz reference period (Mode 2 coarse term)
+TDC_MODE2_NORM_FACTOR: float = 562.5     # Mode 2 fine term scale (matches firmware EASYDATA)
+
+# Firmware v2 register frame widths (space-separated integers per line)
+MODE1_REGISTER_BYTES: int = 9   # time1(3) + cal1(3) + cal2(3)
+MODE2_REGISTER_BYTES: int = 15  # time1(3) + clock_count1(3) + time2(3) + cal1(3) + cal2(3)
+EXPECTED_REGISTER_BYTES: int = MODE1_REGISTER_BYTES  # backward-compatible alias
+
+DEFAULT_MEASUREMENT_MODE: int = 1
+HANDSHAKE_START_BYTE: bytes = b"a"
+HANDSHAKE_MENU_TIMEOUT_SEC: float = 45.0
+HANDSHAKE_STEP_TIMEOUT_SEC: float = 20.0
 
 # Disk I/O and Buffering Settings
 RAW_FLUSH_EVERY_N: int = 1         # Flush raw file on every line to prevent data loss
@@ -68,6 +79,7 @@ SECONDS_PER_MINUTE: int = 60
 ARDUINO_OFFICIAL_VIDS = {
     0x2341,  # Arduino SA
     0x2A03,  # Dog Hunter AG (Arduino.org)
+    0x239A,  # Adafruit (boards often used like Arduino)
 }
 
 COMMON_USB_UART_VIDS = {

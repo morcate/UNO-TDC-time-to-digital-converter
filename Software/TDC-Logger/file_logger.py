@@ -50,20 +50,38 @@ class DualFileLogger:
         self._lock = threading.Lock()
         self._closed = False
 
-        # Determine base name and strip any user-supplied extension (.log, .txt)
+        # Resolve parent directory + session stem.
+        # -o may be "session", "./out/session", or "C:\\data\\session" — keep the parent.
         if base_name:
-            clean_name = Path(base_name).stem
+            given = Path(base_name).expanduser()
+            clean_name = given.stem or datetime.now().strftime("%Y%m%d_%H%M%S")
+            parent = given.parent
+            # bare name → cwd; relative parent → under cwd; absolute parent kept
+            if str(parent) in (".", ""):
+                parent = Path.cwd()
+            elif not parent.is_absolute():
+                parent = (Path.cwd() / parent).resolve()
+            else:
+                parent = parent.resolve()
         else:
             clean_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+            parent = Path.cwd()
 
-        # Use base name if available; otherwise append incremental index (_1, _2, ...)
-        if (Path.cwd() / clean_name).exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise OSError(f"Cannot create output directory {parent}: {exc}") from exc
+
+        # Unique folder under parent if name already exists (_1, _2, ...)
+        folder = parent / clean_name
+        if folder.exists():
             idx = 1
-            while (Path.cwd() / f"{clean_name}_{idx}").exists():
+            while (parent / f"{clean_name}_{idx}").exists():
                 idx += 1
             clean_name = f"{clean_name}_{idx}"
+            folder = parent / clean_name
 
-        self.folder_path = Path.cwd() / clean_name
+        self.folder_path = folder
         self.folder_path.mkdir(parents=True, exist_ok=True)
 
         self.raw_file_path = self.folder_path / f"{clean_name}_raw.log"

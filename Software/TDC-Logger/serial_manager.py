@@ -45,11 +45,20 @@ if sys.platform == "win32":
 class SerialManager:
     """Manages port scanning, connection life-cycle, and RX/TX threads."""
 
-    def __init__(self, port: str, baudrate: int, rx_queue: queue.Queue, stop_event: threading.Event):
+    def __init__(
+        self,
+        port: str,
+        baudrate: int,
+        rx_queue: queue.Queue,
+        stop_event: threading.Event,
+        *,
+        enable_keyboard_tx: bool = True,
+    ):
         self.port = port
         self.baudrate = baudrate
         self.rx_queue = rx_queue
         self.stop_event = stop_event
+        self.enable_keyboard_tx = bool(enable_keyboard_tx)
         self.serial_conn: Optional[serial.Serial] = None
         self.rx_thread: Optional[threading.Thread] = None
         self.tx_thread: Optional[threading.Thread] = None
@@ -77,29 +86,70 @@ class SerialManager:
         """
         Scan available COM ports and assign a priority score for Arduino detection.
 
-        Priority 1: Official Arduino VID or 'Arduino' in description.
+        Priority 1: Official Arduino VID, or Arduino/Uno/Nano/Mega in
+                    description/manufacturer/product.
         Priority 2: Common USB-UART bridges (CH340, FTDI, CP210x, PL2303).
         Priority 3: Other standard serial ports.
+
+        Always re-queries the OS (no cache) so hot-plug is visible.
         """
-        ports = serial.tools.list_ports.comports()
+        try:
+            ports = list(serial.tools.list_ports.comports())
+        except Exception as exc:
+            # Never fail silently — empty list; caller can surface the error
+            print(f"[serial_manager] list_ports failed: {exc}", file=sys.stderr)
+            return []
+
         ranked_list: List[Tuple[int, str, str]] = []
+        # Whole-word / phrase tokens only — avoid "micro" matching "Microsoft"
+        import re
+
+        arduino_re = re.compile(
+            r"(?i)(?<!\w)(arduino|genuino|arduino\s*uno|arduino\s*nano|"
+            r"arduino\s*mega|arduino\s*leonardo|arduino\s*micro|"
+            r"\buno\b|\bnano\b|\bmega\b|\bleonardo\b)(?!\w)"
+        )
 
         for p in ports:
-            desc = p.description or "Unknown Device"
-            hwid = p.hwid or ""
+            desc = (p.description or "Unknown Device").strip()
+            hwid = (p.hwid or "").strip()
+            manufacturer = (getattr(p, "manufacturer", None) or "").strip()
+            product = (getattr(p, "product", None) or "").strip()
+            serial_no = (getattr(p, "serial_number", None) or "").strip()
             vid = p.vid
+            blob = f"{desc} {manufacturer} {product} {hwid}"
 
-            if vid in ARDUINO_OFFICIAL_VIDS or "arduino" in desc.lower():
+            is_arduino = (vid is not None and vid in ARDUINO_OFFICIAL_VIDS) or bool(
+                arduino_re.search(blob)
+            )
+            is_usb_uart = (
+                (vid is not None and vid in COMMON_USB_UART_VIDS)
+                or "usb" in hwid.lower()
+                or "ch340" in blob
+                or "ch341" in blob
+                or "cp210" in blob
+                or "ft232" in blob
+                or "pl2303" in blob
+            )
+
+            if is_arduino:
                 priority = 1
                 tag = "[Arduino]"
-            elif vid in COMMON_USB_UART_VIDS or "usb" in hwid.lower():
+            elif is_usb_uart:
+                # Many Uno clones use CH340 — still preferred over random COM
                 priority = 2
                 tag = "[USB-Serial]"
             else:
                 priority = 3
                 tag = ""
 
-            display_str = f"{p.device} - {desc} {tag}".strip()
+            extra = []
+            if manufacturer and manufacturer.lower() not in desc.lower():
+                extra.append(manufacturer)
+            if serial_no:
+                extra.append(f"SN:{serial_no}")
+            extra_s = f" ({', '.join(extra)})" if extra else ""
+            display_str = f"{p.device} - {desc}{extra_s} {tag}".strip()
             ranked_list.append((priority, p.device, display_str))
 
         ranked_list.sort(key=lambda x: (x[0], x[1]))
@@ -239,9 +289,21 @@ class SerialManager:
         )
         # Non-daemon so we can join them on clean shutdown and finish pending I/O.
         self.rx_thread = threading.Thread(target=self._rx_loop, name="tdc-rx", daemon=True)
-        self.tx_thread = threading.Thread(target=self._tx_loop, name="tdc-tx", daemon=True)
         self.rx_thread.start()
-        self.tx_thread.start()
+        if self.enable_keyboard_tx:
+            self.tx_thread = threading.Thread(target=self._tx_loop, name="tdc-tx", daemon=True)
+            self.tx_thread.start()
+        else:
+            self.tx_thread = None
+
+    def write_bytes(self, data: bytes) -> None:
+        """Write raw bytes to the UART (used by firmware handshake)."""
+        if not data:
+            return
+        if self.serial_conn is None or not self.serial_conn.is_open:
+            raise serial.SerialException("Serial port is not open")
+        self.serial_conn.write(data)
+        self.serial_conn.flush()
 
     def _rx_loop(self) -> None:
         """Continuously read lines from the serial port and push them to rx_queue."""
